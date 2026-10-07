@@ -341,7 +341,9 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
     // was rebuilt with LINQ on every draw.
     private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<Gen5ShaderProgram, uint[]> InterpolatedAttributeCache = new();
 
-    internal uint[] GetPixelAttributes(Gen5ShaderProgram program) =>
+    internal uint[] GetPixelAttributes(Gen5ShaderProgram program) => PixelAttributes(program);
+
+    internal static uint[] PixelAttributes(Gen5ShaderProgram program) =>
         InterpolatedAttributeCache.GetValue(program, static program => program.Instructions
             .Select(static instruction => instruction.Control)
             .OfType<Gen5InterpolationControl>()
