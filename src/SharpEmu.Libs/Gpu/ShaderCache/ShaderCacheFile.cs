@@ -35,7 +35,7 @@ internal sealed class ShaderCacheFile : IDisposable
     private static readonly string[] LegacyFileNames = [LegacyListName, "shader-prewarm.stamp", "shader-prewarm.progress"];
 
     private const uint Magic = 0x48435353;
-    private const uint FormatVersion = 4;
+    private const uint FormatVersion = 5;
     private const uint LegacyMagic = 0x57504553;
     private const uint LegacyFormatVersion = 1;
     private const byte CodeKind = 1;

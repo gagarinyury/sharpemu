@@ -18,7 +18,8 @@ internal sealed record VertexStageInputs(
     uint ScratchDwords,
     int RequiredVertexOutputCount,
     uint PositionExportControl,
-    ShaderClipSpaceTransform ClipSpace);
+    ShaderClipSpaceTransform ClipSpace,
+    bool IeeeMode = false);
 
 internal sealed record PixelStageInputs(
     uint ScratchDwords,
@@ -26,7 +27,9 @@ internal sealed record PixelStageInputs(
     uint InputEnable,
     uint CustomInterpolationMask,
     uint InputAddress,
-    IReadOnlyList<uint> InputCntl);
+    IReadOnlyList<uint> InputCntl,
+    bool IeeeMode = false,
+    bool DepthExportEnable = false);
 
 internal sealed class StageRecord
 {
@@ -584,6 +587,7 @@ internal static class ShaderCacheSerializer
         writer.Write(info.ScratchDwords);
         writer.Write(info.NeedsLocalDataShareBarriers);
         writer.Write(info.WorkgroupRegister);
+        writer.Write(info.IeeeMode);
         writer.Write(registers is not null);
         if (registers is { } values)
         {
@@ -612,6 +616,7 @@ internal static class ShaderCacheSerializer
             ScratchDwords = reader.ReadUInt32(),
             NeedsLocalDataShareBarriers = reader.ReadBoolean(),
             WorkgroupRegister = reader.ReadInt32(),
+            IeeeMode = reader.ReadBoolean(),
         };
         Gen5ComputeSystemRegisters? registers = reader.ReadBoolean()
             ? new Gen5ComputeSystemRegisters(ReadOptional(reader), ReadOptional(reader), ReadOptional(reader), ReadOptional(reader))
@@ -652,6 +657,7 @@ internal static class ShaderCacheSerializer
         writer.Write(clip.OffsetY);
         writer.Write(clip.HalfExtentX);
         writer.Write(clip.HalfExtentY);
+        writer.Write(vertex.IeeeMode);
     }
 
     private static VertexStageInputs ReadVertex(BinaryReader reader)
@@ -690,7 +696,8 @@ internal static class ShaderCacheSerializer
             reader.ReadSingle(),
             reader.ReadSingle());
         return new VertexStageInputs(
-            fetchEmbedded, attributeRegister, bufferRegister, inputs, scratch, requiredOutputs, positionExportControl, clip);
+            fetchEmbedded, attributeRegister, bufferRegister, inputs, scratch, requiredOutputs, positionExportControl, clip,
+            reader.ReadBoolean());
     }
 
     private static void WritePixel(BinaryWriter writer, PixelStageInputs pixel)
@@ -704,6 +711,8 @@ internal static class ShaderCacheSerializer
             writer.Write((int)output.Kind);
             writer.Write(output.ComponentMapping.Packed);
             writer.Write(output.ExportTarget);
+            writer.Write(output.Index);
+            writer.Write(output.DualSourceAlpha);
         }
 
         writer.Write(pixel.InputEnable);
@@ -714,6 +723,9 @@ internal static class ShaderCacheSerializer
         {
             writer.Write(setting);
         }
+
+        writer.Write(pixel.IeeeMode);
+        writer.Write(pixel.DepthExportEnable);
     }
 
     private static PixelStageInputs ReadPixel(BinaryReader reader)
@@ -729,6 +741,8 @@ internal static class ShaderCacheSerializer
                 new Gen5ColorComponentMapping(reader.ReadByte()))
             {
                 ExportTarget = reader.ReadUInt32(),
+                Index = reader.ReadUInt32(),
+                DualSourceAlpha = reader.ReadBoolean(),
             };
         }
 
@@ -741,7 +755,7 @@ internal static class ShaderCacheSerializer
             cntl[index] = reader.ReadUInt32();
         }
 
-        return new PixelStageInputs(scratch, outputs, inputEnable, customMask, inputAddress, cntl);
+        return new PixelStageInputs(scratch, outputs, inputEnable, customMask, inputAddress, cntl, reader.ReadBoolean(), reader.ReadBoolean());
     }
 
     private static void WriteOptional(BinaryWriter writer, uint? value)

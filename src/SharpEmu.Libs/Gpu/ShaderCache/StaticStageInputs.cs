@@ -145,7 +145,8 @@ internal static class StaticStageInputs
             UserDataBase = 0,
             UserDataCount = banks.Shader.Pixel.Resource2.UserScalarCount,
             PushDataCursor = 0,
-            Pixel = new PixelStageInputs(info.ScratchDwords, state.PixelOutputs, enable, info.CustomInterpolationMask, address, cntl),
+            Pixel = new PixelStageInputs(info.ScratchDwords, state.PixelOutputs, enable, info.CustomInterpolationMask, address, cntl,
+                banks.Shader.Pixel.Resource1.IeeeMode, info.DepthExportEnable),
         };
         vertexRecord = new StageRecord
         {
@@ -157,7 +158,8 @@ internal static class StaticStageInputs
             UserDataCount = banks.Shader.Vertex.GeometryResource2.UserScalarCount,
             PushDataCursor = 0,
             Vertex = new VertexStageInputs(
-                false, 0, 0, [], vertexHeader.ScratchDwords, (int)requiredOutputs, shaderInterface.VertexOutputControl, state.ClipSpace),
+                false, 0, 0, [], vertexHeader.ScratchDwords, (int)requiredOutputs, shaderInterface.VertexOutputControl, state.ClipSpace,
+                banks.Shader.Vertex.GeometryResource1.IeeeMode),
         };
         return true;
     }
