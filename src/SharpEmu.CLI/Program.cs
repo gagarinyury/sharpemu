@@ -285,6 +285,8 @@ internal static partial class Program
             return 3;
         }
 
+        GuiLauncher.ConfigureSplashFont();
+
         Log.Info(BuildInfo.Banner);
         Log.Info(HostSystemInfo.Summary);
 
