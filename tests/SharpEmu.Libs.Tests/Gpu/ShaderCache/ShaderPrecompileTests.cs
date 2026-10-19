@@ -2,9 +2,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using SharpEmu.HLE;
+using SharpEmu.HLE.FileSystem;
 using SharpEmu.Libs.Gpu.Pipelines;
 using SharpEmu.Libs.Gpu.Rendering;
 using SharpEmu.Libs.Gpu.ShaderCache;
+using SharpEmu.Libs.Tests.FileSystem;
 using SharpEmu.Libs.Tests.Gpu.Pipelines;
 using SharpEmu.ShaderCompiler;
 using SharpEmu.ShaderCompiler.Resources;
@@ -12,6 +14,7 @@ using Xunit;
 
 namespace SharpEmu.Libs.Tests.Gpu.ShaderCache;
 
+[Collection("App0Archive")]
 public sealed class ShaderPrecompileTests : IDisposable
 {
     private const byte ComputeType = 0;
@@ -128,13 +131,23 @@ public sealed class ShaderPrecompileTests : IDisposable
         Assert.Single(info!.Buffers);
     }
 
-    [Fact]
-    public void TheScannerFindsCodeBeforeEachHeaderAndPairsAdjacentStages()
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    public void TheScannerFindsCodeBeforeEachHeaderAndPairsAdjacentStages(bool archived, bool crossesChunk)
     {
         var game = Path.Combine(_directory, "game");
         Directory.CreateDirectory(game);
         var code = ProgramCode;
-        var bundle = new MemoryStream();
+        using var bundle = new MemoryStream();
+        if (crossesChunk)
+        {
+            bundle.SetLength((8 << 20) - code.Length - 4);
+            bundle.Position = bundle.Length;
+        }
+
         foreach (var (type, semantics) in new[] { (ComputeType, 0u), (GeometryType, 1u), (PixelType, 2u) })
         {
             bundle.Write(code);
@@ -143,27 +156,98 @@ public sealed class ShaderPrecompileTests : IDisposable
 
         File.WriteAllBytes(Path.Combine(game, "shaders.csdr"), bundle.ToArray());
         File.WriteAllBytes(Path.Combine(game, "movie.mp4"), bundle.ToArray());
-        using (var file = Open())
+        if (archived)
         {
-            var progress = new List<(long Done, long Total)>();
-            var result = GameShaderScanner.Scan(game, file, (done, total) => progress.Add((done, total)), CancellationToken.None);
-            Assert.Equal((0L, bundle.Length), progress[0]);
-            Assert.Equal((bundle.Length, bundle.Length), progress[^1]);
-            Assert.Equal(1, result.FilesScanned);
-            Assert.Equal(3, result.Programs);
-            Assert.Equal(3, file.Programs.Count);
-            var (vertex, pixel) = Assert.Single(file.Pairs);
-            Assert.True(file.TryGetProgram(vertex, out var vertexProgram));
-            Assert.True(file.TryGetProgram(pixel, out var pixelProgram));
-            Assert.True(StaticStageInputs.TryParse(vertexProgram, out var vertexHeader) && vertexHeader.Type == AgcShaderType.Geometry);
-            Assert.True(StaticStageInputs.TryParse(pixelProgram, out var pixelHeader) && pixelHeader.Type == AgcShaderType.Pixel);
+            var archivePath = Path.Combine(_directory, "game.zar");
+            ZArchiveWriter.Pack(game, archivePath);
+            game = Path.Combine(_directory, "mount");
+            Directory.CreateDirectory(game);
+            App0Archive.Mount(ZArchive.Open(archivePath)!, game);
         }
 
-        using var reopened = Open();
-        var again = GameShaderScanner.Scan(game, reopened, null, CancellationToken.None);
-        Assert.Equal(0, again.FilesScanned);
-        Assert.Equal(1, again.FilesSkipped);
-        Assert.Equal(3, reopened.Programs.Count);
+        try
+        {
+            using (var file = Open())
+            {
+                var progress = new List<(long Done, long Total)>();
+                var result = GameShaderScanner.Scan(game, file, (done, total) => progress.Add((done, total)), CancellationToken.None);
+                Assert.Equal((0L, bundle.Length), progress[0]);
+                Assert.Equal((bundle.Length, bundle.Length), progress[^1]);
+                Assert.Equal(bundle.Length, result.BytesScanned);
+                Assert.Equal(1, result.FilesScanned);
+                Assert.Equal(3, result.Programs);
+                Assert.Equal(3, file.Programs.Count);
+                var (vertex, pixel) = Assert.Single(file.Pairs);
+                Assert.True(file.TryGetProgram(vertex, out var vertexProgram));
+                Assert.True(file.TryGetProgram(pixel, out var pixelProgram));
+                Assert.True(StaticStageInputs.TryParse(vertexProgram, out var vertexHeader) && vertexHeader.Type == AgcShaderType.Geometry);
+                Assert.True(StaticStageInputs.TryParse(pixelProgram, out var pixelHeader) && pixelHeader.Type == AgcShaderType.Pixel);
+            }
+
+            using var reopened = Open();
+            var again = GameShaderScanner.Scan(game, reopened, null, CancellationToken.None);
+            Assert.Equal(0, again.FilesScanned);
+            Assert.Equal(1, again.FilesSkipped);
+            Assert.Equal(3, reopened.Programs.Count);
+            if (archived)
+            {
+                Assert.Empty(Directory.EnumerateFileSystemEntries(game));
+            }
+        }
+        finally
+        {
+            if (archived)
+            {
+                App0Archive.Unmount();
+            }
+        }
+    }
+
+    [Fact]
+    public void TheScannerInvalidatesChangedArchivesAndPrefersDiskOverrides()
+    {
+        var archivePath = Path.Combine(_directory, "game.zar");
+        var game = Path.Combine(_directory, "mount");
+        Directory.CreateDirectory(game);
+        byte[] Bundle(uint threads) => [.. ProgramCode, .. AgcHeaderBuilder.Build(
+            ComputeType, ProgramCode.Length, shaderRegisters: [(0x207, threads)])];
+        void Mount(uint threads)
+        {
+            File.WriteAllBytes(archivePath, ZArchiveTestWriter.Build([("data/shaders.csdr", Bundle(threads))]));
+            File.SetLastWriteTimeUtc(archivePath, new DateTime(2026, 1, 1, 0, (int)threads, 0, DateTimeKind.Utc));
+            App0Archive.Mount(ZArchive.Open(archivePath)!, game);
+        }
+
+        using var file = Open();
+        try
+        {
+            Mount(1);
+            using var cancelled = new CancellationTokenSource();
+            cancelled.Cancel();
+            Assert.ThrowsAny<OperationCanceledException>(() => GameShaderScanner.Scan(game, file, null, cancelled.Token));
+            Assert.Empty(file.Programs);
+            Assert.Equal(1, GameShaderScanner.Scan(game, file, null, CancellationToken.None).Programs);
+            App0Archive.Unmount();
+
+            Mount(2);
+            var changed = GameShaderScanner.Scan(game, file, null, CancellationToken.None);
+            Assert.Equal(1, changed.FilesScanned);
+            Assert.Equal(1, changed.Programs);
+            Assert.Equal(2, file.Programs.Count);
+            Assert.Equal(1, GameShaderScanner.Scan(game, file, null, CancellationToken.None).FilesSkipped);
+
+            Directory.CreateDirectory(Path.Combine(game, "data"));
+            File.WriteAllBytes(Path.Combine(game, "data", "shaders.csdr"), Bundle(3));
+            var overridden = GameShaderScanner.Scan(game, file, null, CancellationToken.None);
+            Assert.Equal(1, overridden.FilesScanned);
+            Assert.Equal(1, overridden.Programs);
+            Assert.Equal(3, file.Programs.Count);
+            Assert.Equal(1, GameShaderScanner.Scan(game, file, null, CancellationToken.None).FilesSkipped);
+        }
+        finally
+        {
+            App0Archive.Unmount();
+        }
     }
 
     [Fact]
