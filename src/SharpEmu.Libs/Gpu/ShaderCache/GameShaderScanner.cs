@@ -1,7 +1,7 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-using Microsoft.Win32.SafeHandles;
+using SharpEmu.HLE.FileSystem;
 
 namespace SharpEmu.Libs.Gpu.ShaderCache;
 
@@ -21,31 +21,31 @@ internal static class GameShaderScanner
     };
 
     private readonly record struct FoundProgram(long Offset, CachedProgram? Program, AgcShaderType Type, ulong Identity);
+    private readonly record struct ScanSource(string Path, string CachePath, long Length, long WriteTicks);
 
     public static ShaderScanResult Scan(string root, ShaderCacheFile file, Action<long, long>? progress, CancellationToken cancellation)
     {
-        var files = Directory.EnumerateFiles(root, "*", new EnumerationOptions { RecurseSubdirectories = true, IgnoreInaccessible = true })
+        var files = App0Archive.EnumerateFilesRecursive(root, "*", new EnumerationOptions { RecurseSubdirectories = true, IgnoreInaccessible = true })
             .Where(path => !MediaExtensions.Contains(Path.GetExtension(path)))
-            .Select(path => new FileInfo(path))
+            .Select(path => Source(root, path))
             .Where(info => info.Length >= AgcShaderHeader.FixedBytes)
-            .OrderBy(info => info.FullName, StringComparer.Ordinal)
+            .OrderBy(info => info.Path, StringComparer.Ordinal)
             .ToArray();
-        var pending = new List<(FileInfo Info, string Relative)>();
+        var pending = new List<ScanSource>();
         var skipped = 0;
         foreach (var info in files)
         {
-            var relative = Path.GetRelativePath(root, info.FullName).Replace('\\', '/');
-            if (file.TryGetScannedFile(relative, out var known) && known.Size == info.Length &&
-                known.WriteTicks == info.LastWriteTimeUtc.Ticks && known.Scanner == Version)
+            if (file.TryGetScannedFile(info.CachePath, out var known) && known.Size == info.Length &&
+                known.WriteTicks == info.WriteTicks && known.Scanner == Version)
             {
                 skipped++;
                 continue;
             }
 
-            pending.Add((info, relative));
+            pending.Add(info);
         }
 
-        var total = pending.Sum(entry => entry.Info.Length);
+        var total = pending.Sum(entry => entry.Length);
         var scanned = 0L;
         var programs = 0;
         progress?.Invoke(0, total);
@@ -54,18 +54,38 @@ internal static class GameShaderScanner
             new ParallelOptions { MaxDegreeOfParallelism = Math.Clamp(Environment.ProcessorCount / 2, 1, 8), CancellationToken = cancellation },
             entry =>
             {
-                var found = ScanFile(entry.Info, file, bytes =>
+                var found = ScanFile(entry.Path, file, bytes =>
                     progress?.Invoke(Interlocked.Add(ref scanned, bytes), total), cancellation);
                 Interlocked.Add(ref programs, found);
-                file.RecordScannedFile(new ScannedFile(entry.Relative, entry.Info.Length, entry.Info.LastWriteTimeUtc.Ticks, found, Version));
+                file.RecordScannedFile(new ScannedFile(entry.CachePath, entry.Length, entry.WriteTicks, found, Version));
             });
         return new ShaderScanResult(pending.Count, skipped, programs, total);
     }
 
-    private static int ScanFile(FileInfo info, ShaderCacheFile file, Action<long> progress, CancellationToken cancellation)
+    private static ScanSource Source(string root, string path)
     {
-        using var handle = File.OpenHandle(info.FullName, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, FileOptions.SequentialScan);
-        var length = RandomAccess.GetLength(handle);
+        var relative = Path.GetRelativePath(root, path).Replace('\\', '/');
+        var info = new FileInfo(path);
+        if (info.Exists)
+        {
+            return new ScanSource(path, relative, info.Length, info.LastWriteTimeUtc.Ticks);
+        }
+
+        if (!App0Archive.TryResolve(path, out var archive, out var node) || !archive.IsFile(node))
+        {
+            throw new FileNotFoundException("The shader scan source was not found.", path);
+        }
+
+        var container = new FileInfo(archive.Path);
+        // Archive entries have no timestamps; invalidate their scan stamps with the container.
+        return new ScanSource(path, $"zar:{archive.Path}|{container.Length}|{relative}",
+            checked((long)archive.GetFileSize(node)), container.LastWriteTimeUtc.Ticks);
+    }
+
+    private static int ScanFile(string path, ShaderCacheFile file, Action<long> progress, CancellationToken cancellation)
+    {
+        using var stream = App0Archive.OpenReadOrFile(path, FileShare.ReadWrite | FileShare.Delete);
+        var length = stream.Length;
         var signature = AgcShaderHeader.Signature;
         var buffer = new byte[ChunkBytes];
         var found = new List<FoundProgram>();
@@ -73,7 +93,7 @@ internal static class GameShaderScanner
         for (var chunkStart = 0L; chunkStart < length;)
         {
             cancellation.ThrowIfCancellationRequested();
-            var read = ReadAt(handle, buffer, chunkStart);
+            var read = ReadAt(stream, buffer, chunkStart);
             if (read <= 0)
             {
                 break;
@@ -83,7 +103,7 @@ internal static class GameShaderScanner
             for (var position = window.IndexOf(signature); position >= 0;)
             {
                 var offset = chunkStart + position;
-                if (TryRecord(handle, length, offset, file) is { } program)
+                if (TryRecord(stream, length, offset, file) is { } program)
                 {
                     found.Add(program);
                 }
@@ -92,7 +112,7 @@ internal static class GameShaderScanner
                 position = next < 0 ? -1 : position + 1 + next;
             }
 
-            var completed = Math.Min(chunkStart + read, info.Length);
+            var completed = Math.Min(chunkStart + read, length);
             progress(completed - reported);
             reported = completed;
             if (chunkStart + read >= length)
@@ -114,10 +134,10 @@ internal static class GameShaderScanner
         return found.Count(entry => entry.Program is not null);
     }
 
-    private static FoundProgram? TryRecord(SafeFileHandle handle, long length, long offset, ShaderCacheFile file)
+    private static FoundProgram? TryRecord(Stream stream, long length, long offset, ShaderCacheFile file)
     {
         Span<byte> head = stackalloc byte[AgcShaderHeader.FixedBytes];
-        if (offset + head.Length > length || ReadAt(handle, head, offset) != head.Length ||
+        if (offset + head.Length > length || ReadAt(stream, head, offset) != head.Length ||
             !AgcShaderHeader.TryPeekSizes(head, out var headerBytes, out var codeBytes, out var type) ||
             !AgcShaderHeader.IsSupported(type) || offset + headerBytes > length)
         {
@@ -125,7 +145,7 @@ internal static class GameShaderScanner
         }
 
         var headerData = new byte[headerBytes];
-        if (ReadAt(handle, headerData, offset) != headerBytes || !AgcShaderHeader.TryParse(headerData, 0, out var header))
+        if (ReadAt(stream, headerData, offset) != headerBytes || !AgcShaderHeader.TryParse(headerData, 0, out var header))
         {
             return null;
         }
@@ -138,7 +158,7 @@ internal static class GameShaderScanner
             }
 
             var code = new byte[codeBytes + CodeSlackBytes];
-            var read = ReadAt(handle, code, codeOffset);
+            var read = ReadAt(stream, code, codeOffset);
             if (read < codeBytes || !ShaderInventory.TryHash(code, (uint)codeBytes, ScannedCodeAddress, out var hash))
             {
                 continue;
@@ -175,12 +195,13 @@ internal static class GameShaderScanner
         }
     }
 
-    private static int ReadAt(SafeFileHandle handle, Span<byte> destination, long offset)
+    private static int ReadAt(Stream stream, Span<byte> destination, long offset)
     {
+        stream.Position = offset;
         var total = 0;
         while (total < destination.Length)
         {
-            var read = RandomAccess.Read(handle, destination[total..], offset + total);
+            var read = stream.Read(destination[total..]);
             if (read <= 0)
             {
                 break;
