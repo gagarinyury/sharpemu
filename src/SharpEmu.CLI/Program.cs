@@ -1042,6 +1042,32 @@ internal static partial class Program
 
     private static int RunShaderPrecompileOnly(string ebootPath)
     {
+        if (!ZArchive.IsArchivePath(ebootPath))
+        {
+            return RunShaderPrecompileFromDirectory(ebootPath);
+        }
+
+        var cacheRoot = ZArchiveCache.ExtractMetadata(ebootPath);
+        var archive = cacheRoot is null ? null : ZArchive.Open(ebootPath);
+        if (archive is null)
+        {
+            Log.Error($"'{ebootPath}' is not a valid .zar archive.");
+            return 2;
+        }
+
+        App0Archive.Mount(archive, cacheRoot!);
+        try
+        {
+            return RunShaderPrecompileFromDirectory(Path.Combine(cacheRoot!, "eboot.bin"));
+        }
+        finally
+        {
+            App0Archive.Unmount();
+        }
+    }
+
+    private static int RunShaderPrecompileFromDirectory(string ebootPath)
+    {
         var app0Root = Path.GetDirectoryName(ebootPath)!;
         var parent = Path.GetDirectoryName(app0Root);
         if (string.Equals(Path.GetFileName(app0Root), "decrypted", StringComparison.OrdinalIgnoreCase) &&
