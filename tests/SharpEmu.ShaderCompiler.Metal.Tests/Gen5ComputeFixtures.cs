@@ -153,7 +153,50 @@ internal static class Gen5ComputeFixtures
         StoreScalarResourceBase: 8,
         StoreBackingBytes: 32);
 
-    public static readonly Gen5ComputeFixture[] All = [Fmac, Muls, ExecStore, Loop, Lds, TypedLoad, TypedStore];
+    // Packed f16 arithmetic (VOP3P) on two operands with distinct halves, stored to buffer 0 at
+    // dword offsets 0..32: add, mul, min, max, op_sel swapping the halves, neg_lo/neg_hi, clamp, an
+    // inline constant with op_sel_hi, and a NaN lane in min. The last three dwords hold a fused
+    // multiply-add whose exact result lies on an f16 midpoint, so a double rounding changes it.
+    public static readonly Gen5ComputeFixture PackedF16 = new(
+        "packed-f16",
+        [
+            0x7E0002FF, 0xC2003E00, // v_mov_b32 v0, 0xC2003E00
+            0x7E0202FF, 0x38004000, // v_mov_b32 v1, 0x38004000
+            0x7E1402FF, 0x7E003C00, // v_mov_b32 v10, 0x7E003C00
+            0x7E1602FF, 0x40007E00, // v_mov_b32 v11, 0x40007E00
+            0x7E1A02FF, 0x41004100, // v_mov_b32 v13, 0x41004100
+            0x7E1C02FF, 0x75227522, // v_mov_b32 v14, 0x75227522
+            0x7E1E02FF, 0x04EA04EA, // v_mov_b32 v15, 0x04EA04EA
+            0xCC0F4002, 0x18020300, // v_pk_add_f16 v2, v0, v1
+            0xCC104003, 0x18020300, // v_pk_mul_f16 v3, v0, v1
+            0xCC114004, 0x18020300, // v_pk_min_f16 v4, v0, v1
+            0xCC124005, 0x18020300, // v_pk_max_f16 v5, v0, v1
+            0xCC0F1806, 0x00020300, // v_pk_add_f16 v6, v0, v1 op_sel:[1,1] op_sel_hi:[0,0]
+            0xCC0F4107, 0x58020300, // v_pk_add_f16 v7, v0, v1 neg_lo:[0,1] neg_hi:[1,0]
+            0xCC0FC008, 0x18020300, // v_pk_add_f16 v8, v0, v1 clamp
+            0xCC100009, 0x0801E500, // v_pk_mul_f16 v9, v0, 1.0 op_sel_hi:[1,0]
+            0xCC11400C, 0x1802170A, // v_pk_min_f16 v12, v10, v11
+            0xCC0E4010, 0x1C3E1D0D, // v_pk_fma_f16 v16, v13, v14, v15
+            0xCC0E4411, 0x9C3E1D0D, // v_pk_fma_f16 v17, v13, v14, neg_lo:[0,0,1] neg_hi:[0,0,1] v15
+            0xCC0EC012, 0x1C3E1D0D, // v_pk_fma_f16 v18, v13, v14, v15 clamp
+            0xE0700000, 0x80020200, // buffer_store_dword v2, off, s[8:11], 0
+            0xE0700004, 0x80020300, // buffer_store_dword v3, off, s[8:11], 0 offset:4
+            0xE0700008, 0x80020400, // buffer_store_dword v4, off, s[8:11], 0 offset:8
+            0xE070000C, 0x80020500, // buffer_store_dword v5, off, s[8:11], 0 offset:12
+            0xE0700010, 0x80020600, // buffer_store_dword v6, off, s[8:11], 0 offset:16
+            0xE0700014, 0x80020700, // buffer_store_dword v7, off, s[8:11], 0 offset:20
+            0xE0700018, 0x80020800, // buffer_store_dword v8, off, s[8:11], 0 offset:24
+            0xE070001C, 0x80020900, // buffer_store_dword v9, off, s[8:11], 0 offset:28
+            0xE0700020, 0x80020C00, // buffer_store_dword v12, off, s[8:11], 0 offset:32
+            0xE0700024, 0x80021000, // buffer_store_dword v16, off, s[8:11], 0 offset:36
+            0xE0700028, 0x80021100, // buffer_store_dword v17, off, s[8:11], 0 offset:40
+            0xE070002C, 0x80021200, // buffer_store_dword v18, off, s[8:11], 0 offset:44
+            0xBF810000,             // s_endpgm
+        ],
+        StoreScalarResourceBase: 8,
+        StoreBackingBytes: 64);
+
+    public static readonly Gen5ComputeFixture[] All = [Fmac, Muls, ExecStore, Loop, Lds, TypedLoad, TypedStore, PackedF16];
 
     // Minimal pixel program: two interpolated attribute channels plus two
     // inline constants exported to MRT0 (done+vm).

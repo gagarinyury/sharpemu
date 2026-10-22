@@ -479,6 +479,19 @@ public static partial class Gen5MslTranslator
                         expression = $"(uint){wide}";
                         break;
                     }
+                    case "VPkAddF16":
+                    case "VPkMulF16":
+                    case "VPkMinF16":
+                    case "VPkMaxF16":
+                    case "VPkFmaF16":
+                        if (instruction.Control is not Gen5Vop3pControl packedControl)
+                        {
+                            error = $"missing vop3p control for {instruction.Opcode}";
+                            return false;
+                        }
+
+                        expression = EmitPackedF16(instruction, packedControl);
+                        break;
                     default:
                         error = $"unsupported vector opcode {instruction.Opcode}";
                         return false;
@@ -1984,12 +1997,12 @@ public static partial class Gen5MslTranslator
             return Temp("uint", bits);
         }
 
-        private string MinimumHalfBits(string left, string right)
+        private string MinimumHalfBits(string left, string right, bool maximum = false)
         {
             var leftNan = Temp("bool", $"(({left} & 0x7FFFu) > 0x7C00u)");
             var rightNan = Temp("bool", $"(({right} & 0x7FFFu) > 0x7C00u)");
             string Ordered(string value) => $"({value} ^ (({value} & 0x8000u) != 0u ? 0xFFFFu : 0x8000u))";
-            var result = $"({leftNan} ? {right} : ({rightNan} ? {left} : ({Ordered(left)} < {Ordered(right)} ? {left} : {right})))";
+            var result = $"({leftNan} ? {right} : ({rightNan} ? {left} : ({Ordered(left)} {(maximum ? ">" : "<")} {Ordered(right)} ? {left} : {right})))";
             if (_request.IeeeMode)
                 result = $"(({leftNan} && ({left} & 0x200u) == 0u) ? ({left} | 0x200u) : " +
                     $"(({rightNan} && ({right} & 0x200u) == 0u) ? ({right} | 0x200u) : {result}))";
@@ -2016,6 +2029,77 @@ public static partial class Gen5MslTranslator
             if (clamp)
                 bits = Temp("uint", $"((({bits} & 0x8000u) != 0u || ({bits} & 0x7FFFu) > 0x7C00u) ? 0u : min({bits}, 0x3C00u))");
             return HalfResult(instruction, destination, bits);
+        }
+
+        // V_PK_{ADD,MUL,MIN,MAX,FMA}_F16 run the same f16 operation on both result halves. op_sel feeds the low lane
+        // and op_sel_hi the high lane with the chosen half of each source; neg_lo / neg_hi flip the sign of the value
+        // routed to that lane. Operands stay 16-bit patterns so negation and the clamp do not depend on float handling
+        // of NaN. The fused multiply-add uses half fma for a single rounding: widening to f32 first rounds twice and
+        // can differ from the hardware in the last bit.
+        private string EmitPackedF16(Gen5ShaderInstruction instruction, Gen5Vop3pControl control)
+        {
+            var low = PackedF16Lane(instruction, control, highLane: false);
+            var high = PackedF16Lane(instruction, control, highLane: true);
+            return $"({low} | ({high} << 16))";
+        }
+
+        private string PackedF16Lane(Gen5ShaderInstruction instruction, Gen5Vop3pControl control, bool highLane)
+        {
+            var sourceCount = instruction.Opcode == "VPkFmaF16" ? 3 : 2;
+            var bits = new string[sourceCount];
+            for (var index = 0; index < sourceCount; index++)
+            {
+                bits[index] = PackedF16Operand(instruction, control, index, highLane);
+            }
+
+            static string Wide(string value) => $"(float)as_type<half>((ushort){value})";
+            static string Narrow(string value) => $"(uint)as_type<ushort>({value})";
+            var result = instruction.Opcode switch
+            {
+                "VPkAddF16" => Temp("uint", Narrow($"half({Wide(bits[0])} + {Wide(bits[1])})")),
+                "VPkMulF16" => Temp("uint", Narrow($"half({Wide(bits[0])} * {Wide(bits[1])})")),
+                "VPkMinF16" => MinimumHalfBits(bits[0], bits[1]),
+                "VPkMaxF16" => MinimumHalfBits(bits[0], bits[1], maximum: true),
+                _ => Temp("uint", Narrow(
+                    $"fma(as_type<half>((ushort){bits[0]}), as_type<half>((ushort){bits[1]}), as_type<half>((ushort){bits[2]}))")),
+            };
+
+            if (control.Clamp)
+            {
+                // Negative values (including -0) and NaN become 0, anything above 1.0 becomes 1.0.
+                result = Temp("uint", $"((({result} & 0x8000u) != 0u || ({result} & 0x7FFFu) > 0x7C00u) ? 0u : min({result}, 0x3C00u))");
+            }
+
+            return result;
+        }
+
+        private string PackedF16Operand(Gen5ShaderInstruction instruction, Gen5Vop3pControl control, int index, bool highLane)
+        {
+            // A float inline constant is its f16 value in the low half and zero in the high half; every other source
+            // is its 32-bit value, so the selected half is cut out of the raw register or literal.
+            var operand = instruction.Sources[index];
+            var raw = operand is { Kind: Gen5OperandKind.EncodedConstant, Value: >= 240 and <= 248 }
+                ? FormatUInt(operand.Value switch
+                {
+                    240 => 0x3800u,
+                    241 => 0xB800u,
+                    242 => 0x3C00u,
+                    243 => 0xBC00u,
+                    244 => 0x4000u,
+                    245 => 0xC000u,
+                    246 => 0x4400u,
+                    247 => 0xC400u,
+                    _ => 0x3118u,
+                })
+                : RawSource(instruction, index);
+            var selectMask = highLane ? control.OpSelHiMask : control.OpSelMask;
+            var half = Temp("uint", ((selectMask >> index) & 1) != 0
+                ? $"(({raw}) >> 16) & 0xFFFFu"
+                : $"({raw}) & 0xFFFFu");
+            var negateMask = highLane ? control.NegHiMask : control.NegLoMask;
+            return ((negateMask >> index) & 1) != 0
+                ? Temp("uint", $"{half} ^ 0x8000u")
+                : half;
         }
 
         /// <summary>Reads the selected 16-bit half as an integer, sign-extended when requested.</summary>

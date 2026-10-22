@@ -63,6 +63,47 @@ public sealed class MetalRuntimeTests(ITestOutputHelper output)
     }
 
     [Fact]
+    public void PackedF16ProgramExecutesOnTheGpu()
+    {
+        if (SkipWithoutMetalDevice("the execution test")) return;
+
+        const uint Sentinel = 0xDEADBEEFu;
+        var buffer = new byte[64];
+        for (var offset = 0; offset < buffer.Length; offset += sizeof(uint))
+        {
+            BinaryPrimitives.WriteUInt32LittleEndian(buffer.AsSpan(offset), Sentinel);
+        }
+
+        var result = ExecuteRequestOrThrow(Gen5ComputeFixtures.PackedF16, buffer);
+
+        // Operands A = {1.5, -3.0} and B = {2.0, 0.5} (low, high half), expected packed results.
+        uint[] expected =
+        [
+            0xC1004300u, // add: {3.5, -2.5}
+            0xBE004200u, // mul: {3.0, -1.5}
+            0xC2003E00u, // min: {1.5, -3.0}
+            0x38004000u, // max: {2.0, 0.5}
+            0x4300C100u, // op_sel picks the other half: {-3.0 + 0.5, 1.5 + 2.0}
+            0x4300B800u, // neg_lo on src1, neg_hi on src0: {1.5 - 2.0, -(-3.0) + 0.5}
+            0x00003C00u, // clamp: {3.5 -> 1.0, -2.5 -> 0}
+            0xC2003E00u, // times the inline constant 1.0 in the low half of src1
+            0x40003C00u, // min with a NaN in each lane returns the other operand
+            0x7A6B7A6Bu, // fma on an f16 midpoint rounds once (a double rounding gives 0x7A6A)
+            0x7A6A7A6Au, // the same with the addend negated
+            0x3C003C00u, // the same with clamp: both lanes saturate to 1.0
+        ];
+        for (var index = 0; index < expected.Length; index++)
+        {
+            Assert.Equal(expected[index], ReadDword(result, index * sizeof(uint)));
+        }
+
+        for (var offset = expected.Length * sizeof(uint); offset < result.Length; offset += sizeof(uint))
+        {
+            Assert.Equal(Sentinel, ReadDword(result, offset));
+        }
+    }
+
+    [Fact]
     public void LoopProgramIteratesThroughTheDispatcher()
     {
         if (SkipWithoutMetalDevice("the execution test")) return;
